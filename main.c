@@ -1,11 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <unistd.h>
 #include <string.h>
 #include <time.h>
 #include <assert.h>
-#include <dns.h>
+
+#ifdef _WIN32
+    #include <WinSock2.h>
+    #include <WinDNS.h>
+    
+    typedef u_long in_addr_t;
+#else
+    #include <unistd.h>
+    #include <dns.h>
+#endif
 
 #define BUFFER_SIZ 1024
 #define TOTAL_SIZ  2048
@@ -21,6 +29,57 @@ struct SMTP_Client
 
 in_addr_t get_mail_server(const char* domain)
 {
+#ifdef _WIN32
+    DNS_STATUS  result;
+    PDNS_RECORD mx_rr, in_rr, min_rr;
+    DWORD       min_pref;
+    in_addr_t   addr;
+
+    result = DnsQuery_A(
+        domain,
+        DNS_TYPE_MX,
+        DNS_QUERY_STANDARD,
+        NULL,
+        &mx_rr,
+        NULL
+    );
+
+    if (result != DNS_RCODE_NOERROR)
+        return 0;
+
+    min_pref = UINT_MAX;
+
+    for (PDNS_RECORD curr_rr = mx_rr; curr_rr != NULL; curr_rr = curr_rr->pNext)
+    {
+        if (curr_rr->wType == DNS_TYPE_MX)
+        {
+            if (curr_rr->Data.Mx.wPreference < min_pref)
+            {
+                min_pref = curr_rr->Data.Mx.wPreference;
+                min_rr   = curr_rr;
+            }
+        }
+    }
+
+    result = DnsQuery_A(
+        min_rr->Data.Mx.pNameExchange,
+        DNS_TYPE_A,
+        DNS_QUERY_STANDARD,
+        NULL,
+        &in_rr,
+        NULL
+    );
+
+    if (result != DNS_RCODE_NOERROR) 
+        return 0;
+
+    addr = in_rr->Data.A.IpAddress;
+
+    DnsRecordListFree(in_rr, DnsFreeRecordList);
+    DnsRecordListFree(mx_rr, DnsFreeRecordList);
+
+    return addr;
+#else
     DNS_Client*    dns;
     DNS_MX_Answer* ans;
     int len;
@@ -46,6 +105,7 @@ in_addr_t get_mail_server(const char* domain)
     }
 
     return dns_get_iphost(dns, ans[min_idx].Data);
+#endif
 }
 
 void smtp_send(int sock, char* buf, size_t len)
@@ -248,9 +308,14 @@ int main(int argc, const char* argv[])
 {
     if (argc < 2)
     {
-        fprintf(stderr, "Usage: %s <dst_mail>\n", *argv);
+        fprintf(stderr, "Usage: %s <dest_mail>\n", *argv);
         return 1;
     }
+
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2, 0), &wsa_data);
+#endif
 
     int    sock;
     struct sockaddr_in dest;
@@ -262,7 +327,7 @@ int main(int argc, const char* argv[])
 
     client.Sock = socket(AF_INET, SOCK_STREAM, 0);
     client.Buff = malloc(TOTAL_SIZ);
-    client.Rcpt = client.buff + BUFFER_SIZ; 
+    client.Rcpt = client.Buff + BUFFER_SIZ; 
     strncpy(client.Domain, "example.org\r\n", 64);
 
     assert(client.Sock != -1);
@@ -305,7 +370,7 @@ int main(int argc, const char* argv[])
     }
 
 
-    // if (connect(client.sock, (struct sockaddr*)&dest, sizeof(dest)) < 0)
+    // if (connect(client.Sock, (struct sockaddr*)&dest, sizeof(dest)) < 0)
     // {
     //     perror(argv[1]);
     //     return 1;
@@ -315,7 +380,7 @@ int main(int argc, const char* argv[])
     // smtp_sender(&client, "jon.doe@example.org");
     // smtp_recipients(&client, recpts, 2);
 
-    // free(client.buff);
-    // close(client.sock);
+    // free(client.Buff);
+    // close(client.Sock);
     return 0;
 }
