@@ -8,15 +8,16 @@
 #ifdef _WIN32
     #include <WinSock2.h>
     #include <WinDNS.h>
-    
+    #include <TLS.h>
+
     typedef u_long in_addr_t;
 #else
     #include <dns.h>
     #include <unistd.h>
     #include "tls.h"
 
-    #define TLS_Send(a,b,c) SSL_write(a,b,c);
-    #define TLS_Recv(a,b,c) SSL_read(a,b,c);
+    #define TLS_Send(a,b,c) SSL_write((*a).Ssl,b,c);
+    #define TLS_Recv(a,b,c) SSL_read((*a).Ssl,b,c);
 #endif
 
 #define BUFFER_SIZ 1024
@@ -133,50 +134,6 @@ void smtp_send(int sock, const char* buf, size_t len)
     }
 }
 
-void smtp_recv(int sock, char* buf, size_t len)
-{
-    size_t recv_bytes;
-
-    while (len > 0)
-    {
-        recv_bytes = recv(sock, buf, len, 0);
-
-        //TODO: add error propagation
-        if (recv_bytes <= 0)
-            return;
-
-        if (strstr(buf, "\r\n"))
-            break;
-
-        buf += recv_bytes;
-        len -= recv_bytes;
-    }
-
-    buf[recv_bytes] = '\0';
-}
-
-void smtp_tls_recv(struct TLS* tls, char* buf, size_t len)
-{
-    size_t recv_bytes;
-
-    while (len > 0)
-    {
-        recv_bytes = TLS_Recv(tls->Ssl, buf, len);
-
-        //TODO: add error propagation
-        if (recv_bytes <= 0)
-            return;
-
-        if (strstr(buf, "\r\n"))
-            break;
-
-        buf += recv_bytes;
-        len -= recv_bytes;
-    }
-
-    buf[recv_bytes] = '\0';
-}
-
 _Bool smtp_msg_complete(const char* msg)
 {
     char status;
@@ -199,24 +156,65 @@ _Bool smtp_msg_complete(const char* msg)
 void smtp_get_response(struct SMTP_Client* client,
                        int* response_code)
 {
-    do
+    size_t recv_bytes;
+    size_t len;
+    char*  buf;
+
+    len = BUFFER_SIZ;
+    buf = client->Buff;
+
+    while (len > 0)
     {
-        smtp_recv(client->Sock, client->Buff, BUFFER_SIZ);
-        printf("%s", client->Buff);
-    } 
-    while (!smtp_msg_complete(client->Buff));
+        recv_bytes = recv(client->Sock, buf, len, 0);
+
+        //TODO: add error propagation
+        if (recv_bytes <= 0)
+        {
+            perror("Connection");
+            exit(1);
+        }
+
+        buf[recv_bytes] = '\0';
+
+        if (smtp_msg_complete(client->Buff))
+            break;
+
+        buf += recv_bytes;
+        len -= recv_bytes;
+    }
 
     sscanf(client->Buff, "%d", response_code);
 }
 
-void smtp_tls_get_response(struct SMTP_Client* client, int* response_code)
+void smtp_tls_get_response(struct SMTP_Client* client, 
+                           int* response_code)
 {
-    do
+    size_t recv_bytes;
+    size_t len;
+    char*  buf;
+
+    len = BUFFER_SIZ;
+    buf = client->Buff;
+
+    while (len > 0)
     {
-        smtp_tls_recv(&client->TLS, client->Buff, BUFFER_SIZ); 
-        printf("%s", client->Buff);
-    } 
-    while (!smtp_msg_complete(client->Buff));
+        recv_bytes = TLS_Recv(&client->TLS, buf, len);
+
+        //TODO: add error propagation
+        if (recv_bytes <= 0)
+        {
+            perror("Connection");
+            exit(1);
+        }
+        
+        buf[recv_bytes] = '\0';
+
+        if (smtp_msg_complete(client->Buff))
+            break;
+
+        buf += recv_bytes;
+        len -= recv_bytes;
+    }
 
     sscanf(client->Buff, "%d", response_code);
 }
@@ -266,7 +264,7 @@ void smtp_tls_handshake(struct SMTP_Client* client, const char* domain)
     int response_code;
 
     sprintf(client->Buff, "EHLO %s\r\n", domain);
-    TLS_Send(client->TLS.Ssl, client->Buff, strlen(client->Buff));
+    TLS_Send(&client->TLS, client->Buff, strlen(client->Buff));
 
     /* Server options */
     smtp_tls_get_response(client, &response_code);
@@ -277,7 +275,7 @@ void smtp_tls_sender(struct SMTP_Client* client, const char* sender)
     int response_code;
 
     sprintf(client->Buff, "MAIL FROM:<%s>\r\n", sender);
-    TLS_Send(client->TLS.Ssl, client->Buff, strlen(client->Buff));
+    TLS_Send(&client->TLS, client->Buff, strlen(client->Buff));
     smtp_tls_get_response(client, &response_code);
 
     if (response_code != 250)
@@ -299,7 +297,7 @@ void smtp_tls_recipients(struct SMTP_Client* client,
         recipient_len = strlen(recipients) + 1;
 
         sprintf(client->Buff, "RCPT TO:<%s>\r\n", recipients);
-        TLS_Send(client->TLS.Ssl, client->Buff, recipient_len + 11);
+        TLS_Send(&client->TLS, client->Buff, recipient_len + 11);
         smtp_tls_get_response(client, &response_code);
 
         if (response_code != 250)
@@ -318,7 +316,7 @@ void smtp_tls_body(struct SMTP_Client* client, char* body)
 {
     int response_code;
 
-    TLS_Send(client->TLS.Ssl, "DATA\r\n", 6);
+    TLS_Send(&client->TLS, "DATA\r\n", 6);
     smtp_tls_get_response(client, &response_code);
 
     if (response_code != 354)
@@ -329,7 +327,7 @@ void smtp_tls_body(struct SMTP_Client* client, char* body)
         return;
     }
 
-    TLS_Send(client->TLS.Ssl, body, strlen(body));
+    TLS_Send(&client->TLS, body, strlen(body));
     smtp_tls_get_response(client, &response_code);
 
     if (response_code != 250)
@@ -338,7 +336,7 @@ void smtp_tls_body(struct SMTP_Client* client, char* body)
         fprintf(stderr, "%s\n", client->Buff);
     }
 
-    TLS_Send(client->TLS.Ssl, "QUIT\r\n", 6);
+    TLS_Send(&client->TLS, "QUIT\r\n", 6);
 }
 
 void get_recipients(struct SMTP_Client* client)
@@ -431,6 +429,7 @@ int main(int argc, const char* argv[])
     //     p += len;
     // }
 
+
     TLS_Init(&client.TLS);
   
     if (connect(client.Sock, (struct sockaddr*)&dest, sizeof(dest)) < 0)
@@ -439,14 +438,5 @@ int main(int argc, const char* argv[])
         return 1;
     }
 
-    smtp_handshake(&client, "mydomain\r\n");
-    smtp_starttls(&client);
-    smtp_tls_handshake(&client, "mydomain");
-    smtp_tls_sender(&client, "jon.doe@mydomain");
-    smtp_tls_recipients(&client, recpts, 1);
-    smtp_tls_body(&client, buffer);
-
-    free(client.Buff);
-    close(client.Sock);
     return 0;
 }
